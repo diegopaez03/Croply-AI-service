@@ -1,0 +1,10 @@
+# -----------------------------------------------------------------------------
+# Croply AI Service - Development, Testing & Training Dependencies
+# -----------------------------------------------------------------------------
+-r requirements.txt
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+ruff>=0.5.0
+requests>=2.31.0
+matplotlib>=3.7.0
+seaborn>=0.12.0

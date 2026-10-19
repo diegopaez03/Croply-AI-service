@@ -1,0 +1,100 @@
+{
+  "metadata": {
+    "version_analyzer": "1.3.0-lgbm-loam-prod",
+    "parcela_id": "mza-guaymallen-lote-04",
+    "cultivo": "pimiento",
+    "etapa_fenologica": "media",
+    "dias_desde_siembra": 58,
+    "timestamp": "2026-10-17T18:30:00-03:00"
+  },
+  "prediccion_ml": {
+    "accion_recomendada": "SUSPENDER_RIEGO",
+    "severidad": "Alta",
+    "confianza": 1.0,
+    "sensor_origen_principal": "lluvia_mm_24h",
+    "requiere_intervencion_llm": true,
+    "distribucion_probabilidad": {
+      "CORREGIR_PH_SUELO": 0.0,
+      "ESTADO_OPTIMO_SIN_ACCION": 0.0,
+      "POSTERGAR_CURACION_CLIMA": 0.0,
+      "REGAR_PROGRAMADO": 0.0,
+      "REGAR_URGENTE": 0.0,
+      "SUSPENDER_RIEGO": 1.0,
+      "VENTANA_OPTIMA_CURAR": 0.0
+    },
+    "explicabilidad_top3_factores": [
+      {
+        "feature": "precip_pronostico_24h",
+        "valor": 41.503084130642,
+        "shap_attribution": 14.4387
+      },
+      {
+        "feature": "dias_desde_siembra",
+        "valor": 58.0,
+        "shap_attribution": -0.3002
+      },
+      {
+        "feature": "etapa_fenologica_idx",
+        "valor": 2.0,
+        "shap_attribution": -0.2611
+      }
+    ]
+  },
+  "response_schema_esperado": {
+    "tipo": "object",
+    "campos_requeridos": [
+      "titulo_corto",
+      "texto_breve",
+      "texto_explicativo_extendido"
+    ],
+    "especificaciones": {
+      "titulo_corto": "Título imperativo/badge, máximo 40 caracteres (ej. 'Riego urgente recomendado').",
+      "texto_breve": "Resumen directo con datos clave del sensor principal, máximo 120 caracteres para tarjetas UI o notificaciones push.",
+      "texto_explicativo_extendido": "Explicación agronómica y empática de 2 a 3 oraciones contextualizada a la etapa fenológica actual."
+    }
+  },
+  "fallback_determinista": {
+    "titulo_corto": "Suspender riego programado",
+    "texto_breve": "Exceso de humedad (sin telemetría directa) o lluvias pronosticadas (41.5 mm).",
+    "texto_explicativo_extendido": "Se recomienda cancelar o postergar el riego en el lote de Pimiento. La telemetría de lluvia_mm_24h indica saturación o aportes pluviales inminentes suficientes para evitar asfixia radicular y enfermedades fúngicas."
+  },
+  "alertas_climaticas_activas": [
+    "ALERTA_LLUVIA_INTENSA"
+  ],
+  "riesgo_climatico_fenologico": {
+    "nivel": "ALTO",
+    "impacto": "Condición climática evaluada con sensibilidad de etapa media"
+  },
+  "telemetria_actual": {
+    "humedad_suelo_pct": null,
+    "temp_ambiente_c": 26.7,
+    "humedad_ambiente_pct": 78.2,
+    "radiacion_solar_wm2": 0.0,
+    "ph_suelo": 6.6,
+    "viento_kmh": 6.2,
+    "wind_gust_kmh": 6.2,
+    "delta_t_psicrometrico": 2.99,
+    "deficit_hidrico_pct": null
+  },
+  "umbrales_agronomicos_referencia_inta": {
+    "suelo_tipo": "Franco",
+    "capacidad_campo_pct": 30.0,
+    "punto_marchitez_pct": 14.0,
+    "agua_util_pct": 16.0,
+    "rango_ph_optimo": [
+      6.0,
+      7.0
+    ],
+    "viento_maximo_pulverizacion_kmh": 15.0,
+    "delta_t_optimo_pulverizacion": [
+      2.0,
+      8.0
+    ]
+  },
+  "instrucciones_para_gemma4": {
+    "regla_oro": "No inventar datos ni contradecir la accion_recomendada ni las alertas_climaticas_activas.",
+    "enfoque": "Generar obligatoriamente un JSON que cumpla response_schema_esperado con titulo_corto, texto_breve y texto_explicativo_extendido, citando sensor_origen_principal.",
+    "tiempo_maximo_redaccion_seg": 3,
+    "estado_vacio_ui": "Si requiere_intervencion_llm es False, el frontend no invoca al LLM y muestra: 'No hay recomendaciones activas en este momento.'"
+  }
+}

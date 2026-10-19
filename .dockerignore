@@ -1,0 +1,36 @@
+# Git and metadata
+.git/
+.gitignore
+.gitattributes
+
+# Development, tests and training
+training/
+data/
+docs/
+tests/
+scripts/
+
+# Virtual environments and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.idea/
+.vscode/
+
+# Temporary files and reports
+*.log
+*.tmp
+*.pdf
+*.png

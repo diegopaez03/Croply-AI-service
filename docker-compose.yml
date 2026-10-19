@@ -1,0 +1,67 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Servidor Ollama: Motor LLM local para redacción empática agronómica (Gemma 4)
+  # ---------------------------------------------------------------------------
+  croply-ollama:
+    image: ollama/ollama:latest
+    container_name: croply-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_MODEL=gemma4
+      - OLLAMA_KEEP_ALIVE=24h
+    volumes:
+      - ollama_storage:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/scripts/ollama-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/scripts/ollama-entrypoint.sh"]
+    networks:
+      - croply-network
+    # -------------------------------------------------------------------------
+    # Habilitación opcional de aceleración por GPU NVIDIA:
+    # Descomentar el siguiente bloque si el host dispone de NVIDIA Container Toolkit
+    # -------------------------------------------------------------------------
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
+  # Servicio de IA FastAPI: Inferencia LightGBM + SHAP + Orquestador LLM
+  # ---------------------------------------------------------------------------
+  croply-ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croply-ai-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - ENVIRONMENT=production
+      - OLLAMA_BASE_URL=http://croply-ollama:11434
+      - OLLAMA_MODEL=gemma4
+      - OLLAMA_TIMEOUT_SECONDS=45.0
+    depends_on:
+      - croply-ollama
+    networks:
+      - croply-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/ai/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ollama_storage:
+    name: croply_ollama_storage
+
+networks:
+  croply-network:
+    name: croply-network
+    driver: bridge

@@ -1,0 +1,7 @@
+# Ensure shell scripts always use LF line endings
+*.sh text eol=lf
+
+# Binary files
+*.joblib binary
+*.pdf binary
+*.png binary
