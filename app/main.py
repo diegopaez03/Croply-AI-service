@@ -149,7 +149,7 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
     2. recommender.py orquesta la recomendación con Gemma 4 en Ollama o fallback determinista (HU-NA-03).
     3. Retorna la respuesta lista para persistir en PostgreSQL y renderizar en la UI.
     """
-    t_start = time.time()
+    t_start = time.perf_counter()
     analyzer = get_analyzer()
     
     # 1. Ejecutar Análisis Agronómico
@@ -174,10 +174,51 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
             "accion_recomendada": analysis_res["prediccion_ml"]["accion_recomendada"],
             "severidad": analysis_res["prediccion_ml"]["severidad"],
             "sensor_origen_principal": analysis_res["prediccion_ml"]["sensor_origen_principal"],
-            "alertas_climaticas": analysis_res.get("alertas_climaticas_detalle", [])
+            "alertas_climaticas": analysis_res.get("alertas_climaticas_detalle", []),
+            "desglose_latencia_recommender": {
+                "latencia_recommender_ms": 0.0,
+                "invoco_llm": False,
+                "tiempo_prompt_ms": 0.0,
+                "tiempo_ollama_generate_ms": 0.0,
+                "tiempo_parsing_validacion_ms": 0.0,
+                "error": str(e)
+            }
         }
 
-    total_latency_ms = round((time.time() - t_start) * 1000, 2)
+    total_latency_ms = round((time.perf_counter() - t_start) * 1000, 2)
+    desglose_analyzer = analysis_res["metadata"].get("desglose_latencia_analyzer", {})
+    desglose_rec = recommendation_res.get("desglose_latencia_recommender", {})
+    lat_analyzer = analysis_res["metadata"]["latencia_analyzer_ms"]
+    lat_rec = desglose_rec.get("latencia_recommender_ms", 0.0)
+
+    metricas_rendimiento = {
+        "latencia_total_ms": total_latency_ms,
+        "fase_analitica_ml": {
+            "latencia_analyzer_total_ms": lat_analyzer,
+            "preprocesamiento_features_ms": desglose_analyzer.get("preprocesamiento_features_ms", 0.0),
+            "inferencia_lightgbm_ms": desglose_analyzer.get("inferencia_lightgbm_ms", 0.0),
+            "explicabilidad_shap_ms": desglose_analyzer.get("explicabilidad_shap_ms", 0.0),
+            "reglas_climaticas_fallback_ms": desglose_analyzer.get("reglas_climaticas_fallback_ms", 0.0),
+            "pct_del_total": round((lat_analyzer / total_latency_ms) * 100, 2) if total_latency_ms > 0 else 0.0
+        },
+        "fase_generativa_llm": {
+            "latencia_recommender_total_ms": lat_rec,
+            "invoco_llm": desglose_rec.get("invoco_llm", False),
+            "tiempo_prompt_ms": desglose_rec.get("tiempo_prompt_ms", 0.0),
+            "tiempo_ollama_generate_ms": desglose_rec.get("tiempo_ollama_generate_ms", 0.0),
+            "tiempo_parsing_validacion_ms": desglose_rec.get("tiempo_parsing_validacion_ms", 0.0),
+            "pct_del_total": round((lat_rec / total_latency_ms) * 100, 2) if total_latency_ms > 0 else 0.0
+        }
+    }
+
+    logging.info(
+        f"[PERFORMANCE] Parcela '{req.parcela_id}': Total={total_latency_ms:.2f} ms | "
+        f"ML={lat_analyzer:.2f} ms (Prep={desglose_analyzer.get('preprocesamiento_features_ms', 0):.2f}ms, "
+        f"LGBM={desglose_analyzer.get('inferencia_lightgbm_ms', 0):.2f}ms, "
+        f"SHAP={desglose_analyzer.get('explicabilidad_shap_ms', 0):.2f}ms, "
+        f"Reglas={desglose_analyzer.get('reglas_climaticas_fallback_ms', 0):.2f}ms) | "
+        f"LLM={lat_rec:.2f} ms (HTTP={desglose_rec.get('tiempo_ollama_generate_ms', 0):.2f}ms)"
+    )
     
     # 3. Formato Unificado de Respuesta Productiva
     return {
@@ -199,5 +240,6 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         "explicabilidad_top3_factores": analysis_res["prediccion_ml"]["explicabilidad_top3_factores"],
         "telemetria_evaluada": analysis_res["telemetria_actual"],
         "latencia_analyzer_ms": analysis_res["metadata"]["latencia_analyzer_ms"],
-        "latencia_total_ms": total_latency_ms
+        "latencia_total_ms": total_latency_ms,
+        "metricas_rendimiento": metricas_rendimiento
     }

@@ -484,9 +484,10 @@ class CroplyAnalyzer:
     def analyze_parcel(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Ejecuta el análisis agronómico completo sobre la telemetría y pronóstico de una parcela.
+        Mide el rendimiento granular de cada fase analítica con time.perf_counter().
         Latencia objetivo: < 5 ms.
         """
-        t_start = time.time()
+        t_start = time.perf_counter()
         
         cultivo_raw = str(payload.get("cultivo", "tomate")).lower()
         if cultivo_raw not in CROPS_CONFIG:
@@ -580,15 +581,20 @@ class CroplyAnalyzer:
             "hora_del_dia": hora_dia
         }
         df_x = pd.DataFrame([feature_dict])[self.feature_cols]
+        t_prep_ms = (time.perf_counter() - t_start) * 1000
         
-        # Inferencia con LightGBM
+        # Inferencia con LightGBM + Guardarraíl Físico
+        t_infer_start = time.perf_counter()
         proba_raw = self.model.predict_proba(df_x)[0]
         proba_masked = apply_feasibility_mask(proba_raw, self.target_names, feature_dict, cultivo_raw, etapa_idx)
         pred_idx = int(np.argmax(proba_masked))
         pred_action = self.target_names[pred_idx]
         confidence = float(proba_masked[pred_idx])
+        severidad = infer_severity(pred_action, feature_dict)
+        t_infer_ms = (time.perf_counter() - t_infer_start) * 1000
         
         # Explicabilidad SHAP local
+        t_shap_start = time.perf_counter()
         shap_vals = self.explainer.shap_values(df_x)
         if isinstance(shap_vals, list):
             class_shap = shap_vals[pred_idx][0]
@@ -598,7 +604,6 @@ class CroplyAnalyzer:
             class_shap = shap_vals[0]
             
         # Extracción Top 3 factores SHAP sin NaNs, con deduplicación y priorizando SHAP > 0
-        # Ordenar primero por atribución positiva descendente, luego negativa por magnitud
         indices_con_shap = list(range(len(self.feature_cols)))
         pos_indices = sorted([i for i in indices_con_shap if class_shap[i] > 0], key=lambda i: class_shap[i], reverse=True)
         neg_indices = sorted([i for i in indices_con_shap if class_shap[i] <= 0], key=lambda i: abs(class_shap[i]), reverse=True)
@@ -628,9 +633,10 @@ class CroplyAnalyzer:
                 break
                 
         sensor_origen = get_dynamic_sensor_origin(self.feature_cols, class_shap, feature_dict)
-        severidad = infer_severity(pred_action, feature_dict)
+        t_shap_ms = (time.perf_counter() - t_shap_start) * 1000
         
-        # Alertas climáticas automáticas (HU-NA-01)
+        # Alertas climáticas automáticas (HU-NA-01) y Fallback Determinista
+        t_rules_start = time.perf_counter()
         alertas = self.evaluate_climate_alerts(
             t_min_futura, t_max_futura, viento, gust, precip_futura, hum_amb, temp_amb, cfg, etapa_idx
         )
@@ -644,8 +650,9 @@ class CroplyAnalyzer:
         fallback = get_deterministic_fallback(
             pred_action, severidad, sensor_origen, feature_dict, cultivo_raw, etapa_nom, codigos_alertas
         )
+        t_rules_ms = (time.perf_counter() - t_rules_start) * 1000
         
-        latency_ms = round((time.time() - t_start) * 1000, 2)
+        t_total_analyzer_ms = (time.perf_counter() - t_start) * 1000
         
         return {
             "metadata": {
@@ -656,7 +663,13 @@ class CroplyAnalyzer:
                 "etapa_fenologica_idx": etapa_idx,
                 "dias_desde_siembra": dias_siembra,
                 "timestamp": payload.get("timestamp_utc", "2026-10-17T18:30:00Z"),
-                "latencia_analyzer_ms": latency_ms
+                "latencia_analyzer_ms": round(t_total_analyzer_ms, 2),
+                "desglose_latencia_analyzer": {
+                    "preprocesamiento_features_ms": round(t_prep_ms, 3),
+                    "inferencia_lightgbm_ms": round(t_infer_ms, 3),
+                    "explicabilidad_shap_ms": round(t_shap_ms, 3),
+                    "reglas_climaticas_fallback_ms": round(t_rules_ms, 3)
+                }
             },
             "prediccion_ml": {
                 "accion_recomendada": pred_action,

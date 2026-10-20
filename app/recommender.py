@@ -16,6 +16,7 @@ Criterios de producción:
 """
 
 import os
+import time
 import json
 import logging
 import asyncio
@@ -158,7 +159,9 @@ Esquema JSON requerido:
 async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Orquesta la generación de recomendaciones en base al payload en memoria de analyzer.py.
+    Mide granularmente cada fase (construcción de prompt, llamada HTTP a Ollama y validación Pydantic).
     """
+    t_rec_start = time.perf_counter()
     pred = analyzer_payload["prediccion_ml"]
     requiere_llm = pred.get("requiere_intervencion_llm", True)
     fallback = analyzer_payload.get("fallback_determinista", {})
@@ -169,6 +172,7 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
     # -------------------------------------------------------------
     if not requiere_llm:
         logging.info("[recommender.py] Parcela en estado óptimo sin alertas. Aplicando regla de Estado Vacío (HU-NA-03).")
+        t_rec_ms = (time.perf_counter() - t_rec_start) * 1000
         return {
             "recomendacion_vigente": None,
             "mensaje_ui": "No hay recomendaciones activas en este momento.",
@@ -176,20 +180,33 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],
-            "alertas_climaticas": alertas
+            "alertas_climaticas": alertas,
+            "desglose_latencia_recommender": {
+                "latencia_recommender_ms": round(t_rec_ms, 3),
+                "invoco_llm": False,
+                "tiempo_prompt_ms": 0.0,
+                "tiempo_ollama_generate_ms": 0.0,
+                "tiempo_parsing_validacion_ms": 0.0
+            }
         }
 
     # -------------------------------------------------------------
     # 2. Invocación Asíncrona a Ollama con Gemma 4
     # -------------------------------------------------------------
+    t_prompt_start = time.perf_counter()
     prompt = build_gemma_prompt(analyzer_payload)
+    t_prompt_ms = (time.perf_counter() - t_prompt_start) * 1000
     
     current_url = get_ollama_url()
     current_model = get_ollama_model()
     current_timeout = get_ollama_timeout()
     
+    t_http_ms = 0.0
+    t_parse_ms = 0.0
+    
     try:
         logging.info(f"[recommender.py] Solicitando redacción a Ollama ({current_model}) en {current_url}...")
+        t_http_start = time.perf_counter()
         async with httpx.AsyncClient(timeout=current_timeout) as client:
             resp = await client.post(
                 f"{current_url}/api/generate",
@@ -204,18 +221,22 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
                     }
                 }
             )
+        t_http_ms = (time.perf_counter() - t_http_start) * 1000
             
         if resp.status_code != 200:
             raise RuntimeError(f"Ollama respondió con código de estado HTTP {resp.status_code}: {resp.text}")
             
+        t_parse_start = time.perf_counter()
         resp_data = resp.json()
         raw_response = resp_data.get("response", "{}")
         parsed_json = clean_and_parse_llm_json(raw_response)
         
         # Validación de longitud y tipos con Pydantic
         validated_rec = RecommendationTextSchema(**parsed_json)
+        t_parse_ms = (time.perf_counter() - t_parse_start) * 1000
         
-        logging.info("[recommender.py] Recomendación generada exitosamente por Gemma 4.")
+        t_rec_total_ms = (time.perf_counter() - t_rec_start) * 1000
+        logging.info(f"[recommender.py] Recomendación generada exitosamente por Gemma 4 en {t_rec_total_ms:.1f} ms.")
         return {
             "recomendacion_vigente": validated_rec.model_dump(),
             "mensaje_ui": validated_rec.texto_breve,
@@ -224,10 +245,20 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],
-            "alertas_climaticas": alertas
+            "alertas_climaticas": alertas,
+            "desglose_latencia_recommender": {
+                "latencia_recommender_ms": round(t_rec_total_ms, 2),
+                "invoco_llm": True,
+                "tiempo_prompt_ms": round(t_prompt_ms, 3),
+                "tiempo_ollama_generate_ms": round(t_http_ms, 2),
+                "tiempo_parsing_validacion_ms": round(t_parse_ms, 3)
+            }
         }
 
     except (httpx.ConnectError, httpx.TimeoutException, ValidationError, json.JSONDecodeError, RuntimeError, Exception) as err:
+        t_rec_total_ms = (time.perf_counter() - t_rec_start) * 1000
+        if "t_http_start" in locals() and t_http_ms == 0.0:
+            t_http_ms = (time.perf_counter() - t_http_start) * 1000
         logging.warning(f"[recommender.py] [ERR-01] Error o timeout en servicio Ollama Gemma 4 ({type(err).__name__}: {err}). "
                         f"Activando fallback determinista de INTA.")
         
@@ -251,5 +282,13 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],
-            "alertas_climaticas": alertas
+            "alertas_climaticas": alertas,
+            "desglose_latencia_recommender": {
+                "latencia_recommender_ms": round(t_rec_total_ms, 2),
+                "invoco_llm": True,
+                "tiempo_prompt_ms": round(t_prompt_ms, 3),
+                "tiempo_ollama_generate_ms": round(t_http_ms, 2),
+                "tiempo_parsing_validacion_ms": round(t_parse_ms, 3),
+                "error": f"{type(err).__name__}: {str(err)}"
+            }
         }
