@@ -6,7 +6,7 @@ para pequeños y medianos productores de la región de Cuyo (Mendoza).
 
 Endpoints:
 - POST /api/v1/ai/evaluate-parcel: Inferencia analítica (analyzer.py) + redacción empática (recommender.py)
-- GET  /api/v1/ai/health: Diagnóstico de componentes, modelo LightGBM y servicio Ollama
+- GET  /api/v1/ai/health: Diagnóstico de componentes, modelo LightGBM y servicio LLM activo (Ollama / Gemini)
 """
 
 import time
@@ -30,6 +30,7 @@ except ImportError:
     pass
 
 from app.analyzer import get_analyzer, CroplyAnalyzer
+from app.llm import get_llm_provider
 from app.recommender import (
     generate_recommendation,
     get_ollama_url,
@@ -86,6 +87,7 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     edaphic_constants: Dict[str, float]
     ollama_service: Dict[str, Any]
+    llm_provider: Optional[Dict[str, Any]] = None
 
 
 # -------------------------------------------------------------
@@ -96,7 +98,8 @@ async def lifespan(app: FastAPI):
     logging.info("[FastAPI] Inicializando Servicio de IA Croply...")
     # Cargar Singleton en memoria al arrancar
     analyzer = get_analyzer()
-    logging.info(f"[FastAPI] Modelo {analyzer.version} cargado exitosamente. Listo para atender inferencias.")
+    provider = get_llm_provider()
+    logging.info(f"[FastAPI] Modelo {analyzer.version} cargado exitosamente. Proveedor LLM activo: [{provider.provider_name} ({provider.model_name})].")
     yield
     logging.info("[FastAPI] Apagando Servicio de IA Croply.")
 
@@ -114,30 +117,32 @@ app = FastAPI(
 # -------------------------------------------------------------
 @app.get("/api/v1/ai/health", response_model=HealthResponse, tags=["Diagnóstico"])
 async def health_check():
-    """Verifica el estado del modelo LightGBM y la conectividad con Ollama."""
+    """Verifica el estado del modelo LightGBM y la conectividad con el proveedor LLM activo."""
     analyzer = get_analyzer()
-    current_url = get_ollama_url()
-    current_model = get_ollama_model()
-    
-    ollama_status = {"url": current_url, "model": current_model, "reachable": False}
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{current_url}/api/tags")
-            if resp.status_code == 200:
-                ollama_status["reachable"] = True
-                models_list = [m["name"] for m in resp.json().get("models", [])]
-                ollama_status["models_available"] = models_list
-                ollama_status["model_active"] = any(current_model in m for m in models_list)
-    except Exception as exc:
-        ollama_status["reachable"] = False
-        ollama_status["note"] = f"Ollama no accesible en {current_url}: {str(exc)}. El servicio operará automáticamente con fallback_determinista_inta."
+    llm_provider = get_llm_provider()
+    provider_status = await llm_provider.health_check()
+
+    # Si el proveedor activo es Ollama, ollama_service es su diagnóstico directo
+    if llm_provider.provider_name == "ollama":
+        ollama_status = provider_status
+    else:
+        # Si el proveedor activo es Gemini u otro, mantenemos bloque retrocompatible
+        current_url = get_ollama_url()
+        current_model = get_ollama_model()
+        ollama_status = {
+            "url": current_url,
+            "model": current_model,
+            "reachable": False,
+            "note": f"Proveedor activo es '{llm_provider.provider_name}' ({llm_provider.model_name})."
+        }
 
     return {
         "status": "healthy",
         "version": analyzer.version,
         "model_loaded": analyzer.model is not None,
         "edaphic_constants": analyzer.edaphic_constants,
-        "ollama_service": ollama_status
+        "ollama_service": ollama_status,
+        "llm_provider": provider_status
     }
 
 
@@ -146,7 +151,7 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
     """
     Evalúa una parcela integralmente:
     1. analyzer.py ejecuta inferencia LightGBM, reglas de viabilidad y SHAP (<5 ms).
-    2. recommender.py orquesta la recomendación con Gemma 4 en Ollama o fallback determinista (HU-NA-03).
+    2. recommender.py orquesta la recomendación mediante el proveedor LLM activo (Ollama o Gemini) o fallback determinista (HU-NA-03).
     3. Retorna la respuesta lista para persistir en PostgreSQL y renderizar en la UI.
     """
     t_start = time.perf_counter()
@@ -178,7 +183,9 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
             "desglose_latencia_recommender": {
                 "latencia_recommender_ms": 0.0,
                 "invoco_llm": False,
+                "proveedor_activo": "error_fallback",
                 "tiempo_prompt_ms": 0.0,
+                "tiempo_llm_generate_ms": 0.0,
                 "tiempo_ollama_generate_ms": 0.0,
                 "tiempo_parsing_validacion_ms": 0.0,
                 "error": str(e)
@@ -190,6 +197,8 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
     desglose_rec = recommendation_res.get("desglose_latencia_recommender", {})
     lat_analyzer = analysis_res["metadata"]["latencia_analyzer_ms"]
     lat_rec = desglose_rec.get("latencia_recommender_ms", 0.0)
+
+    t_llm_gen = desglose_rec.get("tiempo_llm_generate_ms", desglose_rec.get("tiempo_ollama_generate_ms", 0.0))
 
     metricas_rendimiento = {
         "latencia_total_ms": total_latency_ms,
@@ -204,7 +213,9 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         "fase_generativa_llm": {
             "latencia_recommender_total_ms": lat_rec,
             "invoco_llm": desglose_rec.get("invoco_llm", False),
+            "proveedor_activo": desglose_rec.get("proveedor_activo", "ninguno"),
             "tiempo_prompt_ms": desglose_rec.get("tiempo_prompt_ms", 0.0),
+            "tiempo_llm_generate_ms": t_llm_gen,
             "tiempo_ollama_generate_ms": desglose_rec.get("tiempo_ollama_generate_ms", 0.0),
             "tiempo_parsing_validacion_ms": desglose_rec.get("tiempo_parsing_validacion_ms", 0.0),
             "pct_del_total": round((lat_rec / total_latency_ms) * 100, 2) if total_latency_ms > 0 else 0.0
@@ -217,7 +228,7 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         f"LGBM={desglose_analyzer.get('inferencia_lightgbm_ms', 0):.2f}ms, "
         f"SHAP={desglose_analyzer.get('explicabilidad_shap_ms', 0):.2f}ms, "
         f"Reglas={desglose_analyzer.get('reglas_climaticas_fallback_ms', 0):.2f}ms) | "
-        f"LLM={lat_rec:.2f} ms (HTTP={desglose_rec.get('tiempo_ollama_generate_ms', 0):.2f}ms)"
+        f"LLM [{desglose_rec.get('proveedor_activo', 'n/a')}]={lat_rec:.2f} ms (HTTP={t_llm_gen:.2f}ms)"
     )
     
     # 3. Formato Unificado de Respuesta Productiva

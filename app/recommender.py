@@ -2,13 +2,14 @@
 Croply - Orquestador de Lenguaje Natural (recommender.py)
 =========================================================
 Consume en memoria la salida estructurada de analyzer.py y genera la recomendación
-agronómica para el productor mediante Gemma 4 en Ollama o su fallback determinista.
+agronómica para el productor mediante un proveedor LLM configurable (Ollama Gemma 4,
+Google Gemini API, etc.) o su fallback determinista del INTA.
 
 Criterios de producción:
 1. Regla de Estado Vacío (HU-NA-03): si requiere_intervencion_llm == False,
    retorna inmediatamente sin invocar al LLM.
-2. Llamada asíncrona a Ollama (POST http://localhost:11434/api/generate)
-   con httpx.AsyncClient(timeout=30.0) y formato JSON estructurado.
+2. Abstracción de Proveedor (Strategy Pattern): delega la generación a BaseLLMProvider
+   obtenido vía get_llm_provider().
 3. Validación estricta con Pydantic de titulo_corto (<=40 car), texto_breve (<=120 car)
    y texto_explicativo_extendido.
 4. Tolerancia a fallos [ERR-01]: ante timeout, desconexión o fallo de validación,
@@ -20,8 +21,9 @@ import time
 import json
 import logging
 import asyncio
+import re
+import math
 from typing import Dict, Any, Optional
-import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # Cargar automáticamente variables de entorno desde archivo .env si está disponible
@@ -31,36 +33,36 @@ try:
 except ImportError:
     pass
 
+from app.llm import get_llm_provider, BaseLLMProvider
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
-import re
 
 def clean_and_parse_llm_json(raw_text: str) -> dict:
     """Extrae y parsea el objeto JSON de la respuesta del modelo, tolerando markdown o bloques thinking."""
     text = raw_text.strip()
-    # 1. Remover bloques de razonamiento si estuvieran presentes
+    # 1. Remover bloques de razonamiento si estuvieran presentes (<think>...</think>)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    
+
     # 2. Si viene envuelto en markdown ```json ... ```
     if "```" in text:
         match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if match:
             text = match.group(1).strip()
-            
+
     # 3. Intentar parse directo
     try:
         return json.loads(text)
     except Exception:
         pass
-        
+
     # 4. Buscar el primer '{' y el último '}'
     first_brace = text.find("{")
     last_brace = text.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         return json.loads(text[first_brace:last_brace + 1])
-        
-    raise ValueError(f"No se pudo extraer un JSON válido de la respuesta de Ollama: {raw_text[:200]}")
+
+    raise ValueError(f"No se pudo extraer un JSON válido de la respuesta del LLM: {raw_text[:200]}")
 
 
 def get_ollama_url() -> str:
@@ -106,8 +108,6 @@ class RecommendationTextSchema(BaseModel):
         return s
 
 
-import math
-
 def fmt_sensor_val(val: Any, unit: str = "") -> str:
     """Formatea valores de sensores para evitar 'None%' en prompts a LLMs."""
     if val is None:
@@ -120,24 +120,24 @@ def fmt_sensor_val(val: Any, unit: str = "") -> str:
     return f"{val}{unit}"
 
 
-def build_gemma_prompt(analyzer_payload: Dict[str, Any]) -> str:
-    """Construye un prompt conciso y directo para Gemma 4 en Ollama."""
+def build_recommendation_prompt(analyzer_payload: Dict[str, Any]) -> str:
+    """Construye un prompt conciso y directo para el LLM (Gemma 4, Gemini, etc.)."""
     meta = analyzer_payload["metadata"]
     pred = analyzer_payload["prediccion_ml"]
     tele = analyzer_payload["telemetria_actual"]
     alertas = analyzer_payload["alertas_climaticas_activas"]
     top_factores = pred.get("explicabilidad_top3_factores", [])
-    
+
     factores_str = ", ".join([
         f"{f['sensor_ui']}={f['valor']}"
         for f in top_factores
     ])
-    
-    h_suelo_str = fmt_sensor_val(tele.get('humedad_suelo_pct'), '%')
-    t_amb_str = fmt_sensor_val(tele.get('temp_ambiente_c'), '°C')
-    viento_str = fmt_sensor_val(tele.get('viento_kmh'), ' km/h')
-    lluvia_str = fmt_sensor_val(tele.get('precip_pronostico_24h'), ' mm')
-    
+
+    h_suelo_str = fmt_sensor_val(tele.get("humedad_suelo_pct"), "%")
+    t_amb_str = fmt_sensor_val(tele.get("temp_ambiente_c"), "°C")
+    viento_str = fmt_sensor_val(tele.get("viento_kmh"), " km/h")
+    lluvia_str = fmt_sensor_val(tele.get("precip_pronostico_24h"), " mm")
+
     return f"""Instrucción: Genera directamente el JSON para la recomendación agronómica de Croply (Cuyo, INTA) sin incluir razonamiento ni texto fuera del JSON.
 
 Cultivo: {meta['cultivo'].upper()} (Día {meta['dias_desde_siembra']}, etapa: {meta['etapa_fenologica']})
@@ -156,17 +156,24 @@ Esquema JSON requerido:
 """
 
 
-async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str, Any]:
+# Alias para retrocompatibilidad
+build_gemma_prompt = build_recommendation_prompt
+
+
+async def generate_recommendation(
+    analyzer_payload: Dict[str, Any],
+    provider: Optional[BaseLLMProvider] = None
+) -> Dict[str, Any]:
     """
     Orquesta la generación de recomendaciones en base al payload en memoria de analyzer.py.
-    Mide granularmente cada fase (construcción de prompt, llamada HTTP a Ollama y validación Pydantic).
+    Utiliza el proveedor LLM configurado (Ollama o Gemini) con fallback determinista INTA.
     """
     t_rec_start = time.perf_counter()
     pred = analyzer_payload["prediccion_ml"]
     requiere_llm = pred.get("requiere_intervencion_llm", True)
     fallback = analyzer_payload.get("fallback_determinista", {})
     alertas = analyzer_payload.get("alertas_climaticas_detalle", [])
-    
+
     # -------------------------------------------------------------
     # 1. Regla de Estado Vacío (HU-NA-03)
     # -------------------------------------------------------------
@@ -184,64 +191,59 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "desglose_latencia_recommender": {
                 "latencia_recommender_ms": round(t_rec_ms, 3),
                 "invoco_llm": False,
+                "proveedor_activo": "ninguno",
                 "tiempo_prompt_ms": 0.0,
+                "tiempo_llm_generate_ms": 0.0,
                 "tiempo_ollama_generate_ms": 0.0,
                 "tiempo_parsing_validacion_ms": 0.0
             }
         }
 
     # -------------------------------------------------------------
-    # 2. Invocación Asíncrona a Ollama con Gemma 4
+    # 2. Invocación Asíncrona al Proveedor LLM
     # -------------------------------------------------------------
+    llm_provider = provider or get_llm_provider()
     t_prompt_start = time.perf_counter()
-    prompt = build_gemma_prompt(analyzer_payload)
+    prompt = build_recommendation_prompt(analyzer_payload)
     t_prompt_ms = (time.perf_counter() - t_prompt_start) * 1000
-    
-    current_url = get_ollama_url()
-    current_model = get_ollama_model()
-    current_timeout = get_ollama_timeout()
-    
+
     t_http_ms = 0.0
     t_parse_ms = 0.0
-    
+
     try:
-        logging.info(f"[recommender.py] Solicitando redacción a Ollama ({current_model}) en {current_url}...")
-        t_http_start = time.perf_counter()
-        async with httpx.AsyncClient(timeout=current_timeout) as client:
-            resp = await client.post(
-                f"{current_url}/api/generate",
-                json={
-                    "model": current_model,
-                    "prompt": prompt,
-                    "format": "json",
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 800
-                    }
-                }
-            )
-        t_http_ms = (time.perf_counter() - t_http_start) * 1000
-            
-        if resp.status_code != 200:
-            raise RuntimeError(f"Ollama respondió con código de estado HTTP {resp.status_code}: {resp.text}")
-            
+        logging.info(
+            f"[recommender.py] Solicitando redacción a [{llm_provider.provider_name.upper()}] "
+            f"modelo '{llm_provider.model_name}'..."
+        )
+        gen_result = await llm_provider.generate_recommendation_text(prompt)
+        t_http_ms = gen_result.http_latency_ms
+
         t_parse_start = time.perf_counter()
-        resp_data = resp.json()
-        raw_response = resp_data.get("response", "{}")
-        parsed_json = clean_and_parse_llm_json(raw_response)
-        
+        parsed_json = clean_and_parse_llm_json(gen_result.raw_text)
+
         # Validación de longitud y tipos con Pydantic
         validated_rec = RecommendationTextSchema(**parsed_json)
         t_parse_ms = (time.perf_counter() - t_parse_start) * 1000
-        
+
         t_rec_total_ms = (time.perf_counter() - t_rec_start) * 1000
-        logging.info(f"[recommender.py] Recomendación generada exitosamente por Gemma 4 en {t_rec_total_ms:.1f} ms.")
+        
+        # Etiqueta de fuente para trazabilidad (mantiene 'ollama_gemma4' si es gemma para compatibilidad)
+        if llm_provider.provider_name == "ollama":
+            fuente = "ollama_gemma4" if "gemma" in llm_provider.model_name.lower() else f"ollama_{llm_provider.model_name}"
+        else:
+            fuente = f"{llm_provider.provider_name}_{llm_provider.model_name}"
+
+        logging.info(
+            f"[recommender.py] Recomendación generada exitosamente por [{llm_provider.provider_name}] "
+            f"en {t_rec_total_ms:.1f} ms."
+        )
+
         return {
             "recomendacion_vigente": validated_rec.model_dump(),
             "mensaje_ui": validated_rec.texto_breve,
-            "fuente_generacion": "ollama_gemma4",
-            "modelo_utilizado": current_model,
+            "fuente_generacion": fuente,
+            "proveedor_utilizado": llm_provider.provider_name,
+            "modelo_utilizado": llm_provider.model_name,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],
@@ -249,19 +251,21 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "desglose_latencia_recommender": {
                 "latencia_recommender_ms": round(t_rec_total_ms, 2),
                 "invoco_llm": True,
+                "proveedor_activo": llm_provider.provider_name,
                 "tiempo_prompt_ms": round(t_prompt_ms, 3),
+                "tiempo_llm_generate_ms": round(t_http_ms, 2),
                 "tiempo_ollama_generate_ms": round(t_http_ms, 2),
                 "tiempo_parsing_validacion_ms": round(t_parse_ms, 3)
             }
         }
 
-    except (httpx.ConnectError, httpx.TimeoutException, ValidationError, json.JSONDecodeError, RuntimeError, Exception) as err:
+    except Exception as err:
         t_rec_total_ms = (time.perf_counter() - t_rec_start) * 1000
-        if "t_http_start" in locals() and t_http_ms == 0.0:
-            t_http_ms = (time.perf_counter() - t_http_start) * 1000
-        logging.warning(f"[recommender.py] [ERR-01] Error o timeout en servicio Ollama Gemma 4 ({type(err).__name__}: {err}). "
-                        f"Activando fallback determinista de INTA.")
-        
+        logging.warning(
+            f"[recommender.py] [ERR-01] Error o timeout en servicio LLM [{llm_provider.provider_name}] "
+            f"({type(err).__name__}: {err}). Activando fallback determinista de INTA."
+        )
+
         # Validar fallback determinista con Pydantic para garantizar cumplimiento de schema
         try:
             val_fallback = RecommendationTextSchema(**fallback)
@@ -273,12 +277,14 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
                 "texto_breve": str(fallback.get("texto_breve", "Atención requerida en la parcela."))[:120],
                 "texto_explicativo_extendido": str(fallback.get("texto_explicativo_extendido", "Se detectaron condiciones que requieren intervención."))
             }
-            
+
         return {
             "recomendacion_vigente": fallback_dict,
             "mensaje_ui": fallback_dict["texto_breve"],
             "fuente_generacion": "fallback_determinista_inta",
             "motivo_fallback": f"[ERR-01] {type(err).__name__}",
+            "proveedor_utilizado": llm_provider.provider_name,
+            "modelo_utilizado": llm_provider.model_name,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],
@@ -286,7 +292,9 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "desglose_latencia_recommender": {
                 "latencia_recommender_ms": round(t_rec_total_ms, 2),
                 "invoco_llm": True,
+                "proveedor_activo": llm_provider.provider_name,
                 "tiempo_prompt_ms": round(t_prompt_ms, 3),
+                "tiempo_llm_generate_ms": round(t_http_ms, 2),
                 "tiempo_ollama_generate_ms": round(t_http_ms, 2),
                 "tiempo_parsing_validacion_ms": round(t_parse_ms, 3),
                 "error": f"{type(err).__name__}: {str(err)}"

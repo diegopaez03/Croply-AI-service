@@ -47,10 +47,14 @@ services:
     environment:
       - PORT=${PORT:-8000}
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://croply-ollama:11434}
       - OLLAMA_URL=${OLLAMA_BASE_URL:-http://croply-ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:e4b}
       - OLLAMA_TIMEOUT_SECONDS=${OLLAMA_TIMEOUT_SECONDS:-75.0}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3-flash-preview}
+      - GEMINI_TIMEOUT_SECONDS=${GEMINI_TIMEOUT_SECONDS:-30.0}
     depends_on:
       - croply-ollama
     networks:
