@@ -6,7 +6,7 @@
 
 set -e
 
-MODEL_NAME="${OLLAMA_MODEL:-gemma4}"
+MODEL_NAME="${OLLAMA_MODEL:-gemma4:e4b}"
 
 echo "[Ollama-Entrypoint] Iniciando servidor Ollama en segundo plano..."
 ollama serve &

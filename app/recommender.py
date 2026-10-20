@@ -21,13 +21,65 @@ import logging
 import asyncio
 from typing import Dict, Any, Optional
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# Cargar automáticamente variables de entorno desde archivo .env si está disponible
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4")
-TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30.0"))
+
+import re
+
+def clean_and_parse_llm_json(raw_text: str) -> dict:
+    """Extrae y parsea el objeto JSON de la respuesta del modelo, tolerando markdown o bloques thinking."""
+    text = raw_text.strip()
+    # 1. Remover bloques de razonamiento si estuvieran presentes
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    
+    # 2. Si viene envuelto en markdown ```json ... ```
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            text = match.group(1).strip()
+            
+    # 3. Intentar parse directo
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+        
+    # 4. Buscar el primer '{' y el último '}'
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        return json.loads(text[first_brace:last_brace + 1])
+        
+    raise ValueError(f"No se pudo extraer un JSON válido de la respuesta de Ollama: {raw_text[:200]}")
+
+
+def get_ollama_url() -> str:
+    """Obtiene la URL de Ollama soportando OLLAMA_BASE_URL y OLLAMA_URL."""
+    return os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_URL") or "http://localhost:11434"
+
+
+def get_ollama_model() -> str:
+    """Obtiene el identificador del modelo Ollama configurado (default: gemma4:e4b)."""
+    return os.getenv("OLLAMA_MODEL") or "gemma4:e4b"
+
+
+def get_ollama_timeout() -> float:
+    """Obtiene el timeout en segundos para la llamada al LLM."""
+    return float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "75.0"))
+
+
+OLLAMA_URL = get_ollama_url()
+OLLAMA_MODEL = get_ollama_model()
+TIMEOUT_SECONDS = get_ollama_timeout()
 
 
 class RecommendationTextSchema(BaseModel):
@@ -35,6 +87,22 @@ class RecommendationTextSchema(BaseModel):
     titulo_corto: str = Field(..., max_length=40, description="Título imperativo o badge de acción (<= 40 caracteres)")
     texto_breve: str = Field(..., max_length=120, description="Resumen directo con datos del sensor principal (<= 120 caracteres)")
     texto_explicativo_extendido: str = Field(..., description="Explicación agronómica detallada y empática de 2 a 3 oraciones")
+
+    @field_validator("titulo_corto", mode="before")
+    @classmethod
+    def clamp_titulo(cls, v: Any) -> str:
+        s = str(v).strip()
+        if len(s) > 40:
+            return s[:37] + "..."
+        return s
+
+    @field_validator("texto_breve", mode="before")
+    @classmethod
+    def clamp_texto_breve(cls, v: Any) -> str:
+        s = str(v).strip()
+        if len(s) > 120:
+            return s[:117] + "..."
+        return s
 
 
 import math
@@ -52,7 +120,7 @@ def fmt_sensor_val(val: Any, unit: str = "") -> str:
 
 
 def build_gemma_prompt(analyzer_payload: Dict[str, Any]) -> str:
-    """Construye un prompt de alta precisión para Gemma 4 en Ollama."""
+    """Construye un prompt conciso y directo para Gemma 4 en Ollama."""
     meta = analyzer_payload["metadata"]
     pred = analyzer_payload["prediccion_ml"]
     tele = analyzer_payload["telemetria_actual"]
@@ -60,7 +128,7 @@ def build_gemma_prompt(analyzer_payload: Dict[str, Any]) -> str:
     top_factores = pred.get("explicabilidad_top3_factores", [])
     
     factores_str = ", ".join([
-        f"{f['sensor_ui']} ({f['valor']}) con atribución {f['shap_attribution']}"
+        f"{f['sensor_ui']}={f['valor']}"
         for f in top_factores
     ])
     
@@ -69,26 +137,22 @@ def build_gemma_prompt(analyzer_payload: Dict[str, Any]) -> str:
     viento_str = fmt_sensor_val(tele.get('viento_kmh'), ' km/h')
     lluvia_str = fmt_sensor_val(tele.get('precip_pronostico_24h'), ' mm')
     
-    prompt = f"""Eres el Asistente Agronómico Experto de Croply, especializado en horticultura y vitivinicultura de Cuyo (Mendoza, Argentina) bajo pautas del INTA.
+    return f"""Instrucción: Genera directamente el JSON para la recomendación agronómica de Croply (Cuyo, INTA) sin incluir razonamiento ni texto fuera del JSON.
 
-CONTEXTO DE LA PARCELA:
-- Cultivo: {meta['cultivo'].upper()} (Día {meta['dias_desde_siembra']}, etapa fenológica: {meta['etapa_fenologica']})
-- Acción agronómica prioritaria obligatoria: {pred['accion_recomendada']}
-- Nivel de Severidad: {pred['severidad']} (Confianza del modelo: {pred['confianza'] * 100:.1f}%)
-- Sensor físico determinante: {pred['sensor_origen_principal']}
-- Factores clave detectados (SHAP): {factores_str}
-- Alertas climáticas activas: {alertas if alertas else 'Ninguna'}
-- Telemetría actual: Humedad suelo={h_suelo_str}, Temp={t_amb_str}, Viento={viento_str}, Pronóstico lluvia 24h={lluvia_str}.
+Cultivo: {meta['cultivo'].upper()} (Día {meta['dias_desde_siembra']}, etapa: {meta['etapa_fenologica']})
+Acción prioritaria: {pred['accion_recomendada']} (Severidad: {pred['severidad']}, Confianza: {pred['confianza'] * 100:.1f}%)
+Sensor determinante: {pred['sensor_origen_principal']}
+Factores SHAP: {factores_str}
+Alertas climáticas: {alertas if alertas else 'Ninguna'}
+Telemetría: Suelo={h_suelo_str}, Temp={t_amb_str}, Viento={viento_str}, Lluvia 24h={lluvia_str}.
 
-REGLAS INVIOLABLES DE RESPUESTA:
-1. Responde ÚNICAMENTE un objeto JSON válido con las claves "titulo_corto", "texto_breve" y "texto_explicativo_extendido".
-2. "titulo_corto": Frase imperativa directa. Máximo 40 caracteres. Ejemplo: "Riego urgente recomendado".
-3. "texto_breve": Síntesis con datos del sensor principal. Máximo 120 caracteres para tarjetas de la app.
-4. "texto_explicativo_extendido": 2 a 3 oraciones empáticas y profesionales explicando el motivo físico agronómico y el paso a seguir, citando el sensor principal.
-5. NO inventes datos que no figuren arriba. NO contradigas la acción {pred['accion_recomendada']}.
-
-Responde exclusivamente con el JSON:"""
-    return prompt
+Esquema JSON requerido:
+{{
+  "titulo_corto": "Frase imperativa directa <= 40 caracteres",
+  "texto_breve": "Síntesis con datos del sensor principal <= 120 caracteres",
+  "texto_explicativo_extendido": "2 a 3 oraciones empáticas explicando la causa agronómica y recomendación."
+}}
+"""
 
 
 async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,19 +184,23 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
     # -------------------------------------------------------------
     prompt = build_gemma_prompt(analyzer_payload)
     
+    current_url = get_ollama_url()
+    current_model = get_ollama_model()
+    current_timeout = get_ollama_timeout()
+    
     try:
-        logging.info(f"[recommender.py] Solicitando redacción a Ollama ({OLLAMA_MODEL}) en {OLLAMA_URL}...")
-        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+        logging.info(f"[recommender.py] Solicitando redacción a Ollama ({current_model}) en {current_url}...")
+        async with httpx.AsyncClient(timeout=current_timeout) as client:
             resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
+                f"{current_url}/api/generate",
                 json={
-                    "model": OLLAMA_MODEL,
+                    "model": current_model,
                     "prompt": prompt,
                     "format": "json",
                     "stream": False,
                     "options": {
                         "temperature": 0.2,
-                        "num_predict": 250
+                        "num_predict": 800
                     }
                 }
             )
@@ -142,7 +210,7 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             
         resp_data = resp.json()
         raw_response = resp_data.get("response", "{}")
-        parsed_json = json.loads(raw_response)
+        parsed_json = clean_and_parse_llm_json(raw_response)
         
         # Validación de longitud y tipos con Pydantic
         validated_rec = RecommendationTextSchema(**parsed_json)
@@ -152,7 +220,7 @@ async def generate_recommendation(analyzer_payload: Dict[str, Any]) -> Dict[str,
             "recomendacion_vigente": validated_rec.model_dump(),
             "mensaje_ui": validated_rec.texto_breve,
             "fuente_generacion": "ollama_gemma4",
-            "modelo_utilizado": OLLAMA_MODEL,
+            "modelo_utilizado": current_model,
             "accion_recomendada": pred["accion_recomendada"],
             "severidad": pred["severidad"],
             "sensor_origen_principal": pred["sensor_origen_principal"],

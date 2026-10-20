@@ -22,8 +22,21 @@ from pydantic import BaseModel, Field
 # Asegurar que la raíz del proyecto esté en sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Cargar automáticamente variables de entorno desde .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from app.analyzer import get_analyzer, CroplyAnalyzer
-from app.recommender import generate_recommendation, OLLAMA_URL, OLLAMA_MODEL
+from app.recommender import (
+    generate_recommendation,
+    get_ollama_url,
+    get_ollama_model,
+    OLLAMA_URL,
+    OLLAMA_MODEL
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -103,17 +116,21 @@ app = FastAPI(
 async def health_check():
     """Verifica el estado del modelo LightGBM y la conectividad con Ollama."""
     analyzer = get_analyzer()
+    current_url = get_ollama_url()
+    current_model = get_ollama_model()
     
-    ollama_status = {"url": OLLAMA_URL, "model": OLLAMA_MODEL, "reachable": False}
+    ollama_status = {"url": current_url, "model": current_model, "reachable": False}
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(f"{OLLAMA_URL}/api/tags")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{current_url}/api/tags")
             if resp.status_code == 200:
                 ollama_status["reachable"] = True
-                ollama_status["models_available"] = [m["name"] for m in resp.json().get("models", [])]
-    except Exception:
+                models_list = [m["name"] for m in resp.json().get("models", [])]
+                ollama_status["models_available"] = models_list
+                ollama_status["model_active"] = any(current_model in m for m in models_list)
+    except Exception as exc:
         ollama_status["reachable"] = False
-        ollama_status["note"] = "Ollama desconectado. El servicio operará automáticamente con fallback_determinista_inta."
+        ollama_status["note"] = f"Ollama no accesible en {current_url}: {str(exc)}. El servicio operará automáticamente con fallback_determinista_inta."
 
     return {
         "status": "healthy",
