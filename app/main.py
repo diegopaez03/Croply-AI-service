@@ -79,6 +79,26 @@ class EvaluateParcelRequest(BaseModel):
     telemetria_iot: TelemetriaIoT
     pronostico_meteo: PronosticoMeteo
     historial_manejo: HistorialManejo
+    accion_previa: Optional[str] = Field(
+        None,
+        description="Acción cacheada. Si LightGBM repite esta acción, no se redacta con el LLM.",
+    )
+
+
+class ContextoCultivoClima(BaseModel):
+    cultivo: str = Field(..., description="Nombre del cultivo en minúsculas")
+    etapa_fenologica_idx: int = Field(..., ge=0, le=3)
+
+
+class EvaluateClimateRequest(BaseModel):
+    temp_min_pronostico: float
+    temp_max_pronostico: float
+    precip_pronostico_24h: float = Field(..., ge=0.0)
+    viento_kmh: float = Field(..., ge=0.0)
+    wind_gust_kmh: Optional[float] = Field(None, ge=0.0)
+    humedad_relativa: float = Field(..., ge=0.0, le=100.0)
+    temp_actual: float
+    contextos: List[ContextoCultivoClima] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -166,31 +186,33 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         logging.error(f"Error interno en analyzer.py: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error en analyzer: {str(e)}")
 
-    # 2. Orquestar Recomendación en Lenguaje Natural
-    try:
-        recommendation_res = await generate_recommendation(analysis_res)
-    except Exception as e:
-        logging.error(f"Error interno en recommender.py: {e}", exc_info=True)
-        # Salvaguarda de emergencia
+    # 2. Bypass del LLM si la acción no cambió respecto de la caché del backend.
+    accion_predicha = analysis_res["prediccion_ml"]["accion_recomendada"]
+    omitio_llm = bool(req.accion_previa) and req.accion_previa == accion_predicha
+    if omitio_llm:
+        logging.info(
+            f"[FastAPI] Bypass de redacción: la acción '{accion_predicha}' coincide con la caché."
+        )
         recommendation_res = {
-            "recomendacion_vigente": analysis_res.get("fallback_determinista"),
-            "mensaje_ui": "Recomendación generada por reglas agronómicas de contingencia.",
-            "fuente_generacion": "fallback_determinista_inta",
-            "accion_recomendada": analysis_res["prediccion_ml"]["accion_recomendada"],
+            "recomendacion_vigente": None,
+            "mensaje_ui": None,
+            "fuente_generacion": "bypass_sin_llm",
+            "accion_recomendada": accion_predicha,
             "severidad": analysis_res["prediccion_ml"]["severidad"],
             "sensor_origen_principal": analysis_res["prediccion_ml"]["sensor_origen_principal"],
             "alertas_climaticas": analysis_res.get("alertas_climaticas_detalle", []),
             "desglose_latencia_recommender": {
                 "latencia_recommender_ms": 0.0,
                 "invoco_llm": False,
-                "proveedor_activo": "error_fallback",
+                "proveedor_activo": "ninguno",
                 "tiempo_prompt_ms": 0.0,
                 "tiempo_llm_generate_ms": 0.0,
                 "tiempo_ollama_generate_ms": 0.0,
                 "tiempo_parsing_validacion_ms": 0.0,
-                "error": str(e)
-            }
+            },
         }
+    else:
+        recommendation_res = await _recomendar_o_fallback(analysis_res)
 
     total_latency_ms = round((time.perf_counter() - t_start) * 1000, 2)
     desglose_analyzer = analysis_res["metadata"].get("desglose_latencia_analyzer", {})
@@ -242,7 +264,7 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         "severidad": analysis_res["prediccion_ml"]["severidad"],
         "confianza_ml": analysis_res["prediccion_ml"]["confianza"],
         "sensor_origen_principal": analysis_res["prediccion_ml"]["sensor_origen_principal"],
-        "requiere_intervencion_llm": analysis_res["prediccion_ml"]["requiere_intervencion_llm"],
+        "requiere_intervencion_llm": False if omitio_llm else analysis_res["prediccion_ml"]["requiere_intervencion_llm"],
         "recomendacion_vigente": recommendation_res["recomendacion_vigente"],
         "mensaje_ui": recommendation_res["mensaje_ui"],
         "fuente_generacion": recommendation_res["fuente_generacion"],
@@ -254,3 +276,50 @@ async def evaluate_parcel(req: EvaluateParcelRequest):
         "latencia_total_ms": total_latency_ms,
         "metricas_rendimiento": metricas_rendimiento
     }
+
+
+async def _recomendar_o_fallback(analysis_res: Dict[str, Any]) -> Dict[str, Any]:
+    """Redacta con el LLM o deja el fallback determinista si el proveedor falla."""
+    try:
+        return await generate_recommendation(analysis_res)
+    except Exception as e:
+        logging.error(f"Error interno en recommender.py: {e}", exc_info=True)
+        return {
+            "recomendacion_vigente": analysis_res.get("fallback_determinista"),
+            "mensaje_ui": "Recomendación generada por reglas agronómicas de contingencia.",
+            "fuente_generacion": "fallback_determinista_inta",
+            "accion_recomendada": analysis_res["prediccion_ml"]["accion_recomendada"],
+            "severidad": analysis_res["prediccion_ml"]["severidad"],
+            "sensor_origen_principal": analysis_res["prediccion_ml"]["sensor_origen_principal"],
+            "alertas_climaticas": analysis_res.get("alertas_climaticas_detalle", []),
+            "desglose_latencia_recommender": {
+                "latencia_recommender_ms": 0.0,
+                "invoco_llm": False,
+                "proveedor_activo": "error_fallback",
+                "tiempo_prompt_ms": 0.0,
+                "tiempo_llm_generate_ms": 0.0,
+                "tiempo_ollama_generate_ms": 0.0,
+                "tiempo_parsing_validacion_ms": 0.0,
+                "error": str(e)
+            }
+        }
+
+
+@app.post("/api/v1/ai/evaluate-climate", tags=["Alertas Climáticas"])
+async def evaluate_climate(req: EvaluateClimateRequest):
+    """Evalúa solo las reglas climáticas deterministas, sin LightGBM ni Gemma."""
+    analyzer = get_analyzer()
+    try:
+        alertas = analyzer.unir_alertas_climaticas(
+            req.temp_min_pronostico,
+            req.temp_max_pronostico,
+            req.viento_kmh,
+            req.wind_gust_kmh,
+            req.precip_pronostico_24h,
+            req.humedad_relativa,
+            req.temp_actual,
+            [contexto.model_dump() for contexto in req.contextos],
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    return {"alertas_climaticas": alertas}

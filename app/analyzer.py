@@ -481,6 +481,49 @@ class CroplyAnalyzer:
             
         return alertas
 
+    def unir_alertas_climaticas(
+        self,
+        t_min: float,
+        t_max: float,
+        wind: float,
+        gust: Optional[float],
+        precip_24h: float,
+        rh: float,
+        temp: float,
+        contextos: List[Dict[str, Any]],
+    ) -> List[Dict[str, str]]:
+        """Une alertas de uno o más cultivos sin inferencia ni redacción.
+
+        Sin contextos solo corren reglas universales: el umbral de helada
+        agronómica queda fuera de rango y la etapa no es crítica.
+        """
+        rafaga = float(gust) if gust is not None else round(wind * 1.25, 1)
+        evaluaciones: List[Dict[str, Any]] = contextos or [{"_solo_universal": True}]
+        unidas: Dict[str, Dict[str, str]] = {}
+        orden = {"Baja": 1, "Media": 2, "Alta": 3}
+
+        for ctx in evaluaciones:
+            if ctx.get("_solo_universal"):
+                cfg = {"temp_helada": -100.0}
+                etapa_idx = 1
+            else:
+                cultivo = str(ctx.get("cultivo", "")).lower()
+                if cultivo not in CROPS_CONFIG:
+                    raise ValueError(
+                        f"Cultivo '{cultivo}' no soportado. Disponibles: {list(CROPS_CONFIG.keys())}"
+                    )
+                cfg = CROPS_CONFIG[cultivo]
+                etapa_idx = int(ctx["etapa_fenologica_idx"])
+
+            for alerta in self.evaluate_climate_alerts(
+                t_min, t_max, wind, rafaga, precip_24h, rh, temp, cfg, etapa_idx
+            ):
+                previa = unidas.get(alerta["codigo_alerta"])
+                if previa is None or orden[alerta["severidad"]] > orden[previa["severidad"]]:
+                    unidas[alerta["codigo_alerta"]] = alerta
+
+        return list(unidas.values())
+
     def analyze_parcel(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Ejecuta el análisis agronómico completo sobre la telemetría y pronóstico de una parcela.
