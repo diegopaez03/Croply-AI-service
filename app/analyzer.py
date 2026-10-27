@@ -585,7 +585,7 @@ class CroplyAnalyzer:
         rad_solar = iot.get("radiacion_solar_wm2")
         rad_solar = float(rad_solar) if (rad_solar is not None and not pd.isna(rad_solar)) else np.nan
         
-        lluvia_pasada = float(iot.get("lluvia_mm_24h", 0.0))
+        lluvia_pasada = float(iot.get("lluvia_mm_24h", 0.0)) if iot.get("lluvia_mm_24h") is not None else 0.0
         
         viento = float(meteo.get("viento_kmh", 10.0))
         gust = meteo.get("wind_gust_kmh")

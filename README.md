@@ -135,7 +135,7 @@ docker compose logs -f croply-ollama
 ### Opción B: Ejecución Local en Desarrollo
 ```bash
 # Iniciar servidor FastAPI con recarga en caliente
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
 ```
 
 ---
@@ -147,7 +147,7 @@ Verifica el estado del modelo en memoria, constantes edafológicas y conectivida
 
 **Ejemplo cURL:**
 ```bash
-curl -X GET "http://localhost:8000/api/v1/ai/health" -H "Accept: application/json"
+curl -X GET "http://localhost:9000/api/v1/ai/health" -H "Accept: application/json"
 ```
 
 **Respuesta de ejemplo (200 OK):**
@@ -176,7 +176,7 @@ Recibe la telemetría IoT de la parcela, el pronóstico meteorológico y el hist
 
 **Ejemplo cURL (Caso Estrés Hídrico en Tomate):**
 ```bash
-curl -X POST "http://localhost:8000/api/v1/ai/evaluate-parcel" \
+curl -X POST "http://localhost:9000/api/v1/ai/evaluate-parcel" \
   -H "Content-Type: application/json" \
   -d '{
     "parcela_id": "parcela-norte-tomate-01",

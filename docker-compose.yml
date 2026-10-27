@@ -41,11 +41,11 @@ services:
     container_name: croply-ai-service
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "9000:9000"
     env_file:
       - .env
     environment:
-      - PORT=${PORT:-8000}
+      - PORT=${PORT:-9000}
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://croply-ollama:11434}
@@ -60,7 +60,7 @@ services:
     networks:
       - croply-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/ai/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/ai/health"]
       interval: 30s
       timeout: 5s
       retries: 3
